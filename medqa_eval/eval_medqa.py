@@ -4,6 +4,11 @@
 Phase 1A of the Sentinel-X research roadmap: sanity-check evaluation on the
 MedQA benchmark (1,273 4-choice MCQ). Google reports 87.7% accuracy.
 
+All output is written to a single JSONL file (one JSON object per line):
+  - Line 1:  {"type": "run_header", ...}   run metadata
+  - Lines 2+: {"type": "question", ...}    one per question (appended live)
+  - Last line: {"type": "summary", ...}    aggregate stats
+
 Usage:
     # Sanity check (50 questions, ~5-10 min)
     python medqa_eval/eval_medqa.py --max-samples 50
@@ -246,6 +251,13 @@ def extract_answer(response: str) -> tuple[str, str]:
 # Inference
 # ---------------------------------------------------------------------------
 
+def append_jsonl(path: Path, record: dict) -> None:
+    """Append a single JSON object as one line to a JSONL file."""
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+        f.flush()
+
+
 def run_inference(
     model,
     tokenizer,
@@ -253,12 +265,13 @@ def run_inference(
     temperature: float,
     max_new_tokens: int,
     results_accumulator: list[dict] | None = None,
-    log_path: Path | None = None,
+    output_path: Path | None = None,
 ) -> list[dict]:
     """Run model on each MedQA question and collect results.
 
     If results_accumulator is provided, results are appended to it in real-time
-    (enables partial saves on Ctrl+C).
+    (enables partial saves on Ctrl+C).  Each question result is also appended
+    as a JSON line to output_path.
     """
     results = results_accumulator if results_accumulator is not None else []
     total = len(dataset)
@@ -308,43 +321,25 @@ def run_inference(
         if extraction_method == "FAILED_EXTRACTION":
             failed_extractions += 1
 
-        results.append(
-            {
-                "question_id": i,
-                "question": question,
-                "options": options,
-                "correct_answer": correct_answer,
-                "model_answer": model_answer,
-                "is_correct": is_correct,
-                "model_response": response,
-                "extraction_method": extraction_method,
-                "output_tokens": output_tokens,
-                "time_seconds": round(elapsed, 2),
-            }
-        )
+        record = {
+            "type": "question",
+            "question_id": i,
+            "question": question,
+            "options": options,
+            "correct_answer": correct_answer,
+            "model_answer": model_answer,
+            "is_correct": is_correct,
+            "model_response": response,
+            "extraction_method": extraction_method,
+            "output_tokens": output_tokens,
+            "time_seconds": round(elapsed, 2),
+        }
 
-        # Append to live log file
-        if log_path is not None:
-            option_text = "\n".join(f"{k}. {v}" for k, v in sorted(options.items()))
-            verdict = "CORRECT" if is_correct else "WRONG"
-            separator = "=" * 80
-            with open(log_path, "a") as lf:
-                lf.write(
-                    f"{separator}\n"
-                    f"Q {i + 1}/{total}  |  {mark}  |  {elapsed:.1f}s  |  "
-                    f"model={model_answer}  correct={correct_answer}  |  "
-                    f"extraction={extraction_method}\n"
-                    f"{separator}\n\n"
-                    f"--- PROMPT ---\n{prompt}\n\n"
-                    f"--- QUESTION ---\n{question}\n\n"
-                    f"--- OPTIONS ---\n{option_text}\n\n"
-                    f"--- MODEL RESPONSE ---\n{response}\n\n"
-                    f"--- PARSED ANSWER ---\n"
-                    f"Model answer: {model_answer}  (extraction: {extraction_method})\n"
-                    f"Correct answer: {correct_answer}\n"
-                    f"Verdict: {verdict}\n\n"
-                )
-                lf.flush()
+        results.append(record)
+
+        # Append to JSONL output (one line per question, written live)
+        if output_path is not None:
+            append_jsonl(output_path, record)
 
         # Free intermediate tensors
         del inputs, outputs, generated_ids
@@ -369,23 +364,8 @@ def run_inference(
 # Results & reporting
 # ---------------------------------------------------------------------------
 
-def save_results(
-    results: list[dict],
-    args: argparse.Namespace,
-    total_time: float,
-) -> tuple[Path, Path]:
-    """Write per-question and summary JSON files. Returns (results_path, summary_path)."""
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Per-question results
-    results_path = output_dir / f"medqa_results_{ts}.json"
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-
-    # Summary
+def build_summary(results: list[dict], args: argparse.Namespace, total_time: float) -> dict:
+    """Compute aggregate summary from in-memory results."""
     total_questions = len(results)
     correct = sum(1 for r in results if r["is_correct"])
     failed = sum(1 for r in results if r["extraction_method"] == "FAILED_EXTRACTION")
@@ -393,7 +373,8 @@ def save_results(
     avg_tokens = total_tokens / total_questions if total_questions else 0
     avg_time = total_time / total_questions if total_questions else 0
 
-    summary = {
+    return {
+        "type": "summary",
         "model_id": args.model_id,
         "dataset": "openlifescienceai/medqa",
         "split": "test",
@@ -408,18 +389,9 @@ def save_results(
         "max_new_tokens": args.max_new_tokens,
     }
 
-    summary_path = output_dir / f"medqa_summary_{ts}.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
 
-    return results_path, summary_path
-
-
-def print_summary(summary_path: Path) -> None:
+def print_summary(s: dict) -> None:
     """Print a formatted summary table to stdout."""
-    with open(summary_path) as f:
-        s = json.load(f)
-
     print("\n" + "=" * 60)
     print("  MedQA Evaluation Summary")
     print("=" * 60)
@@ -443,19 +415,22 @@ def print_summary(summary_path: Path) -> None:
 _partial_results: list[dict] = []
 _args: argparse.Namespace | None = None
 _start_time: float = 0.0
+_output_path: Path | None = None
 
 
 def _signal_handler(signum, frame):
-    """Save partial results on interrupt, then exit."""
+    """Append summary to the JSONL file on interrupt, then exit."""
     sig_name = signal.Signals(signum).name
-    print(f"\n\nReceived {sig_name} — saving partial results ...")
+    print(f"\n\nReceived {sig_name} — saving partial summary ...")
 
     if _partial_results and _args is not None:
         elapsed = time.time() - _start_time
-        results_path, summary_path = save_results(_partial_results, _args, elapsed)
-        print(f"  Partial results: {results_path}")
-        print(f"  Partial summary: {summary_path}")
-        print_summary(summary_path)
+        summary = build_summary(_partial_results, _args, elapsed)
+        summary["partial"] = True
+        if _output_path is not None:
+            append_jsonl(_output_path, summary)
+            print(f"  Partial summary appended to: {_output_path}")
+        print_summary(summary)
 
     sys.exit(1)
 
@@ -465,7 +440,7 @@ def _signal_handler(signum, frame):
 # ---------------------------------------------------------------------------
 
 def main():
-    global _partial_results, _args, _start_time
+    global _partial_results, _args, _start_time, _output_path
 
     args = parse_args()
     _args = args
@@ -490,14 +465,26 @@ def main():
         # Load model
         model, tokenizer = load_model(args.model_id)
 
-        # Run inference
+        # Prepare single JSONL output file
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = output_dir / f"medqa_live_log_{ts}.txt"
+        output_path = output_dir / f"medqa_eval_{ts}.jsonl"
+        _output_path = output_path
+
+        # Write run header as the first line
+        append_jsonl(output_path, {
+            "type": "run_header",
+            "model_id": args.model_id,
+            "timestamp": ts,
+            "max_samples": args.max_samples,
+            "temperature": args.temperature,
+            "max_new_tokens": args.max_new_tokens,
+            "total_questions": len(dataset),
+        })
 
         print(f"\nStarting evaluation ({len(dataset)} questions) ...")
-        print(f"  Live log: {log_path}\n")
+        print(f"  Output: {output_path}\n")
         _start_time = time.time()
 
         _partial_results.clear()  # reset for this run
@@ -508,17 +495,17 @@ def main():
             temperature=args.temperature,
             max_new_tokens=args.max_new_tokens,
             results_accumulator=_partial_results,
-            log_path=log_path,
+            output_path=output_path,
         )
 
         total_time = time.time() - _start_time
 
-        # Save results
-        results_path, summary_path = save_results(results, args, total_time)
-        print(f"\nResults saved:")
-        print(f"  Per-question: {results_path}")
-        print(f"  Summary:      {summary_path}")
-        print_summary(summary_path)
+        # Append summary as the final line
+        summary = build_summary(results, args, total_time)
+        append_jsonl(output_path, summary)
+
+        print(f"\nResults saved: {output_path}")
+        print_summary(summary)
 
     finally:
         # GPU cleanup — always runs

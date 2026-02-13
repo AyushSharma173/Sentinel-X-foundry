@@ -1,0 +1,52 @@
+# ── Python bytecode & packaging ──────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Evaluation results (generated at runtime) ───────────────
+medqa_eval/results/
+
+# ── ML / AI artifacts (large files — never commit) ──────────
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+models/
+checkpoints/
+wandb/
+runs/
+logs/
+
+# ── Secrets & environment variables ─────────────────────────
+.env
+.env.*
+*.key
+*.pem
+
+# ── IDE & editor ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS junk ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ─────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Claude Code local settings ──────────────────────────────
+.claude/

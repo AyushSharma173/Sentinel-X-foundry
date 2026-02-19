@@ -8,7 +8,7 @@ See [roadmap.md](roadmap.md) for the full research plan.
 ## Setup
 
 ```bash
-pip install unsloth transformers datasets torch bitsandbytes accelerate trl
+pip install vllm datasets torch bitsandbytes
 ```
 
 **Hardware requirement:** NVIDIA GPU with >= 20 GB VRAM (RTX 4090 / A100).
@@ -20,13 +20,13 @@ pip install unsloth transformers datasets torch bitsandbytes accelerate trl
 ### MedQA Baseline Evaluation
 
 Evaluates MedGemma 27B (4-bit) on the MedQA benchmark (1,273 MCQs).
-All output goes to a **single JSONL file** that appends live as the model answers each question.
+Uses **vLLM offline mode** for batch inference — all prompts are submitted at once and vLLM handles continuous batching, scheduling, and KV-cache management internally.
 
 ```bash
-# Sanity check — 50 questions (~5-10 min)
+# Sanity check — 50 questions (~2-5 min)
 python medqa_eval/eval_medqa.py --max-samples 50
 
-# Full evaluation — 1,273 questions (~2-3 hours)
+# Full evaluation — 1,273 questions (~1-2 hours)
 python medqa_eval/eval_medqa.py
 ```
 
@@ -38,8 +38,11 @@ python medqa_eval/eval_medqa.py
 | `--max-samples` | all 1,273 | Limit number of questions |
 | `--output-dir` | `medqa_eval/results` | Directory for the output JSONL |
 | `--temperature` | `0.0` | Sampling temperature (0 = deterministic) |
-| `--max-new-tokens` | `5000` | Max tokens per generation |
-| `--batch-size` | `1` | Batch size (1 is safe for 24 GB VRAM) |
+| `--max-new-tokens` | `2048` | Max tokens per generation |
+| `--gpu-memory-utilization` | `0.92` | Fraction of GPU memory for vLLM |
+| `--max-model-len` | `2560` | Max sequence length (prompt + generation) |
+| `--enforce-eager` | off | Disable CUDA graphs (slower, less memory) |
+| `--no-chunked-prefill` | off | Disable chunked prefill |
 
 **Output format** (`medqa_eval/results/medqa_eval_<timestamp>.jsonl`):
 

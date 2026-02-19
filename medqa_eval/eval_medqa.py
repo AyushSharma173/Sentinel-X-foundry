@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""MedQA Baseline Evaluation for MedGemma 27B (4-bit quantized).
+"""MedQA Baseline Evaluation for MedGemma 27B (4-bit quantized) — vLLM backend.
 
 Phase 1A of the Sentinel-X research roadmap: sanity-check evaluation on the
 MedQA benchmark (1,273 4-choice MCQ). Google reports 87.7% accuracy.
+
+Uses vLLM offline mode for batch inference with continuous batching and
+PagedAttention.  All prompts are submitted at once; vLLM handles scheduling
+and KV-cache management internally.
 
 All output is written to a single JSONL file (one JSON object per line):
   - Line 1:  {"type": "run_header", ...}   run metadata
@@ -10,15 +14,14 @@ All output is written to a single JSONL file (one JSON object per line):
   - Last line: {"type": "summary", ...}    aggregate stats
 
 Usage:
-    # Sanity check (50 questions, ~5-10 min)
+    # Sanity check (50 questions, ~30 min on RTX 4090)
     python medqa_eval/eval_medqa.py --max-samples 50
 
-    # Full evaluation (1,273 questions, ~2-3 hours)
+    # Full evaluation (1,273 questions)
     python medqa_eval/eval_medqa.py
 """
 
 import argparse
-import gc
 import json
 import re
 import signal
@@ -27,9 +30,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import os
+
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +43,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate MedGemma on the MedQA benchmark"
+        description="Evaluate MedGemma on the MedQA benchmark (vLLM backend)"
     )
     parser.add_argument(
         "--model-id",
@@ -67,14 +72,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=5000,
-        help="Max new tokens per generation (default: 5000)",
+        default=512,
+        help="Max new tokens per generation (default: 1536)",
     )
     parser.add_argument(
-        "--batch-size",
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.92,
+        help="Fraction of GPU memory for vLLM (default: 0.85; leaves headroom for BnB dequant buffers)",
+    )
+    parser.add_argument(
+        "--max-model-len",
         type=int,
-        default=1,
-        help="Batch size (default: 1, safe for 24GB VRAM)",
+        default=1024,
+        help="Maximum sequence length (prompt + generation) (default: 2048)",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        default=False,
+        help="Disable CUDA graphs (required for BnB 4-bit on 24GB GPUs to avoid OOM during graph capture)",
+    )
+    parser.add_argument(
+        "--no-chunked-prefill",
+        action="store_true",
+        default=False,
+        help="Disable chunked prefill",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=16,
+        help="Max concurrent sequences in vLLM scheduler (default: 16; lower to reduce sampler warmup VRAM)",
     )
     return parser.parse_args()
 
@@ -99,7 +128,7 @@ def get_vram_info() -> dict:
     }
 
 
-def preflight_vram_check(min_free_gb: float = 15.0) -> None:
+def preflight_vram_check(min_free_gb: float = 10.0) -> None:
     """Abort early if insufficient VRAM is available."""
     if not torch.cuda.is_available():
         print("ERROR: No CUDA GPU detected. This script requires a GPU.")
@@ -117,39 +146,6 @@ def preflight_vram_check(min_free_gb: float = 15.0) -> None:
             f"but only {info['free_gb']:.1f} GB available."
         )
         sys.exit(1)
-
-
-def cleanup_gpu(model=None, tokenizer=None) -> None:
-    """Two-pass GPU memory cleanup (handles BitsAndBytes quantized models)."""
-    vram_before = get_vram_info()
-    print(f"\nGPU cleanup — VRAM before: {vram_before['allocated_gb']:.2f} GB allocated")
-
-    # Move model to CPU first (may fail for quantized models)
-    if model is not None:
-        try:
-            model.to("cpu")
-        except Exception:
-            pass  # quantized models can't always be moved
-
-    # Delete references
-    del model
-    del tokenizer
-
-    # First pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-    # Second pass (catches BitsAndBytes stragglers)
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-
-    vram_after = get_vram_info()
-    print(f"GPU cleanup — VRAM after:  {vram_after['allocated_gb']:.2f} GB allocated")
 
 
 # ---------------------------------------------------------------------------
@@ -174,50 +170,50 @@ def load_medqa(max_samples: int | None = None):
 # Model
 # ---------------------------------------------------------------------------
 
-def load_model(model_id: str):
-    """Load pre-quantized model (no BitsAndBytesConfig needed)."""
-    print(f"\nLoading tokenizer: {model_id} ...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    print(f"Loading model: {model_id} ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map="auto",
-        max_memory={0: "20GiB", "cpu": "32GiB"},
+def load_vllm_model(args: argparse.Namespace) -> LLM:
+    """Load model via vLLM for offline batch inference."""
+    print(f"\nLoading model via vLLM: {args.model_id} ...")
+    llm = LLM(
+        model=args.model_id,
+        quantization="bitsandbytes",
+        load_format="bitsandbytes",
+        dtype="bfloat16",
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        enforce_eager=args.enforce_eager,
+        enable_chunked_prefill=not args.no_chunked_prefill,
+        trust_remote_code=True,
+        # kv_cache_dtype="fp8"
     )
-    model.eval()
-
     vram = get_vram_info()
     print(f"  Model loaded — VRAM: {vram['allocated_gb']:.2f} GB allocated")
-    return model, tokenizer
+    return llm
 
 
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
 
+# SYSTEM_PROMPT = (
+#     "You are a medical expert. Answer the following multiple-choice medical question. "
+#     "Think step by step, then provide your final answer as \"The answer is (X)\" "
+#     "where X is the letter A, B, C, or D."
+# )
+
+
+# NEW:
 SYSTEM_PROMPT = (
     "You are a medical expert. Answer the following multiple-choice medical question. "
-    "Think step by step, then provide your final answer as \"The answer is (X)\" "
-    "where X is the letter A, B, C, or D."
+    "Reason through it in 2-3 concise sentences, then state your final answer as "
+    "\"The answer is (X)\" where X is the letter A, B, C, or D."
 )
 
 
-def build_prompt(question: str, options: dict, tokenizer) -> str:
-    """Build a chat-formatted prompt for a single MedQA question."""
+def build_messages(question: str, options: dict) -> list[dict]:
+    """Build chat messages for a single MedQA question."""
     option_text = "\n".join(f"{k}. {v}" for k, v in sorted(options.items()))
-    user_content = f"{question}\n\n{option_text}"
-
-    messages = [
-        {"role": "user", "content": f"{SYSTEM_PROMPT}\n\n{user_content}"},
-    ]
-
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    return prompt
+    return [{"role": "user", "content": f"{SYSTEM_PROMPT}\n\n{question}\n\n{option_text}"}]
 
 
 # ---------------------------------------------------------------------------
@@ -258,106 +254,99 @@ def append_jsonl(path: Path, record: dict) -> None:
         f.flush()
 
 
-def run_inference(
-    model,
-    tokenizer,
+def run_inference_vllm(
+    llm: LLM,
     dataset,
-    temperature: float,
-    max_new_tokens: int,
-    results_accumulator: list[dict] | None = None,
-    output_path: Path | None = None,
+    args: argparse.Namespace,
+    results_accumulator: list[dict],
+    output_path: Path,
 ) -> list[dict]:
-    """Run model on each MedQA question and collect results.
+    """Run batch inference via vLLM on all MedQA questions.
 
-    If results_accumulator is provided, results are appended to it in real-time
-    (enables partial saves on Ctrl+C).  Each question result is also appended
-    as a JSON line to output_path.
+    All prompts are submitted at once; vLLM handles batching internally.
+    Results are written to JSONL as they are post-processed.
     """
-    results = results_accumulator if results_accumulator is not None else []
     total = len(dataset)
-    correct = 0
-    failed_extractions = 0
-    total_output_tokens = 0
 
-    do_sample = temperature > 0
-
+    # Build all conversations and parallel metadata
+    conversations = []
+    metadata = []
     for i, example in enumerate(dataset):
         data = example["data"]
         question = data["Question"]
         options = data["Options"]
         correct_answer = data["Correct Option"]
 
-        # Build prompt and tokenize
-        prompt = build_prompt(question, options, tokenizer)
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        messages = build_messages(question, options)
+        conversations.append(messages)
+        metadata.append({
+            "question_id": i,
+            "question": question,
+            "options": options,
+            "correct_answer": correct_answer,
+        })
 
-        # Generate
-        print(f"  Q {i + 1}/{total} ...", end="", flush=True)
-        t0 = time.time()
-        with torch.inference_mode():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature if do_sample else None,
-            )
-        elapsed = time.time() - t0
+    # Create sampling params
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=args.max_new_tokens,
+    )
 
-        # Decode only the generated tokens (strip the prompt)
-        prompt_len = inputs["input_ids"].shape[1]
-        generated_ids = outputs[0][prompt_len:]
-        response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        output_tokens = len(generated_ids)
-        total_output_tokens += output_tokens
+    # Single batch call — vLLM handles scheduling and batching
+    print(f"\n  Submitting {total} prompts to vLLM for batch inference ...")
+    t0 = time.time()
+    outputs = llm.chat(conversations, sampling_params, use_tqdm=True)
+    total_time = time.time() - t0
+    amortized_time = total_time / total if total else 0
 
-        # Extract answer
+    print(f"\n  Batch inference complete: {total_time:.1f}s total, {amortized_time:.1f}s/question")
+
+    # Post-process outputs
+    correct = 0
+    failed_extractions = 0
+
+    for output, meta in zip(outputs, metadata):
+        response = output.outputs[0].text
+        output_tokens = len(output.outputs[0].token_ids)
+
         model_answer, extraction_method = extract_answer(response)
-        is_correct = model_answer == correct_answer
+        is_correct = model_answer == meta["correct_answer"]
         mark = "ok" if is_correct else "WRONG"
-        print(f" {elapsed:.1f}s  [{mark}]  model={model_answer} correct={correct_answer}")
 
         if is_correct:
             correct += 1
         if extraction_method == "FAILED_EXTRACTION":
             failed_extractions += 1
 
+        print(
+            f"  Q {meta['question_id'] + 1}/{total}  [{mark}]  "
+            f"model={model_answer} correct={meta['correct_answer']}"
+        )
+
         record = {
             "type": "question",
-            "question_id": i,
-            "question": question,
-            "options": options,
-            "correct_answer": correct_answer,
+            "question_id": meta["question_id"],
+            "question": meta["question"],
+            "options": meta["options"],
+            "correct_answer": meta["correct_answer"],
             "model_answer": model_answer,
             "is_correct": is_correct,
             "model_response": response,
             "extraction_method": extraction_method,
             "output_tokens": output_tokens,
-            "time_seconds": round(elapsed, 2),
+            "time_seconds": round(amortized_time, 2),
         }
 
-        results.append(record)
+        results_accumulator.append(record)
+        append_jsonl(output_path, record)
 
-        # Append to JSONL output (one line per question, written live)
-        if output_path is not None:
-            append_jsonl(output_path, record)
+    acc = correct / total * 100 if total else 0
+    print(
+        f"\n  Processed {total} results: "
+        f"acc={acc:.1f}%  failed_extractions={failed_extractions}"
+    )
 
-        # Free intermediate tensors
-        del inputs, outputs, generated_ids
-        torch.cuda.empty_cache()
-
-        # Progress logging every 10 questions
-        if (i + 1) % 10 == 0 or (i + 1) == total:
-            acc = correct / (i + 1) * 100
-            vram = get_vram_info()
-            print(
-                f"  [{i + 1:>4}/{total}]  "
-                f"acc={acc:.1f}%  "
-                f"failed_extractions={failed_extractions}  "
-                f"vram={vram['allocated_gb']:.1f}GB  "
-                f"last={elapsed:.1f}s"
-            )
-
-    return results
+    return results_accumulator
 
 
 # ---------------------------------------------------------------------------
@@ -446,70 +435,66 @@ def main():
     _args = args
 
     print("=" * 60)
-    print("  MedQA Baseline Evaluation")
+    print("  MedQA Baseline Evaluation (vLLM)")
     print("=" * 60)
 
     # Pre-flight
-    preflight_vram_check(min_free_gb=15.0)
+    preflight_vram_check(min_free_gb=10.0)
 
     # Register signal handlers
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    model = None
-    tokenizer = None
-    try:
-        # Load dataset
-        dataset = load_medqa(args.max_samples)
+    # Load dataset
+    dataset = load_medqa(args.max_samples)
 
-        # Load model
-        model, tokenizer = load_model(args.model_id)
+    # Load model via vLLM
+    llm = load_vllm_model(args)
 
-        # Prepare single JSONL output file
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = output_dir / f"medqa_eval_{ts}.jsonl"
-        _output_path = output_path
+    # Prepare single JSONL output file
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = output_dir / f"medqa_eval_{ts}.jsonl"
+    _output_path = output_path
 
-        # Write run header as the first line
-        append_jsonl(output_path, {
-            "type": "run_header",
-            "model_id": args.model_id,
-            "timestamp": ts,
-            "max_samples": args.max_samples,
-            "temperature": args.temperature,
-            "max_new_tokens": args.max_new_tokens,
-            "total_questions": len(dataset),
-        })
+    # Write run header as the first line
+    append_jsonl(output_path, {
+        "type": "run_header",
+        "model_id": args.model_id,
+        "inference_engine": "vllm",
+        "timestamp": ts,
+        "max_samples": args.max_samples,
+        "temperature": args.temperature,
+        "max_new_tokens": args.max_new_tokens,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "enforce_eager": args.enforce_eager,
+        "total_questions": len(dataset),
+    })
 
-        print(f"\nStarting evaluation ({len(dataset)} questions) ...")
-        print(f"  Output: {output_path}\n")
-        _start_time = time.time()
+    print(f"\nStarting evaluation ({len(dataset)} questions) ...")
+    print(f"  Output: {output_path}\n")
+    _start_time = time.time()
 
-        _partial_results.clear()  # reset for this run
-        results = run_inference(
-            model,
-            tokenizer,
-            dataset,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
-            results_accumulator=_partial_results,
-            output_path=output_path,
-        )
+    _partial_results.clear()
+    results = run_inference_vllm(
+        llm,
+        dataset,
+        args,
+        results_accumulator=_partial_results,
+        output_path=output_path,
+    )
 
-        total_time = time.time() - _start_time
+    total_time = time.time() - _start_time
 
-        # Append summary as the final line
-        summary = build_summary(results, args, total_time)
-        append_jsonl(output_path, summary)
+    # Append summary as the final line
+    summary = build_summary(results, args, total_time)
+    append_jsonl(output_path, summary)
 
-        print(f"\nResults saved: {output_path}")
-        print_summary(summary)
-
-    finally:
-        # GPU cleanup — always runs
-        cleanup_gpu(model, tokenizer)
+    print(f"\nResults saved: {output_path}")
+    print_summary(summary)
 
 
 if __name__ == "__main__":
